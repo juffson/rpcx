@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/julienschmidt/httprouter"
+	"github.com/rs/cors"
 	"github.com/smallnest/rpcx/log"
 	"github.com/smallnest/rpcx/protocol"
 	"github.com/smallnest/rpcx/share"
@@ -24,13 +26,30 @@ func (s *Server) startGateway(network string, ln net.Listener) net.Listener {
 
 	m := cmux.New(ln)
 
-	httpLn := m.Match(cmux.HTTP1Fast())
-	rpcxLn := m.Match(cmux.Any())
+	rpcxLn := m.Match(rpcxPrefixByteMatcher())
 
-	go s.startHTTP1APIGateway(httpLn)
+	if !s.DisableJSONRPC {
+		jsonrpc2Ln := m.Match(cmux.HTTP1HeaderField("X-JSONRPC-2.0", "true"))
+		go s.startJSONRPC2(jsonrpc2Ln)
+	}
+
+	if !s.DisableHTTPGateway {
+		httpLn := m.Match(cmux.HTTP1Fast())
+		go s.startHTTP1APIGateway(httpLn)
+	}
+
 	go m.Serve()
 
 	return rpcxLn
+}
+
+func rpcxPrefixByteMatcher() cmux.Matcher {
+	magic := protocol.MagicNumber()
+	return func(r io.Reader) bool {
+		buf := make([]byte, 1)
+		n, _ := r.Read(buf)
+		return n == 1 && buf[0] == magic
+	}
 }
 
 func (s *Server) startHTTP1APIGateway(ln net.Listener) {
@@ -39,11 +58,25 @@ func (s *Server) startHTTP1APIGateway(ln net.Listener) {
 	router.GET("/*servicePath", s.handleGatewayRequest)
 	router.PUT("/*servicePath", s.handleGatewayRequest)
 
-	s.mu.Lock()
-	s.gatewayHTTPServer = &http.Server{Handler: router}
-	s.mu.Unlock()
+	if s.corsOptions != nil {
+		opt := cors.Options(*s.corsOptions)
+		c := cors.New(opt)
+		mux := c.Handler(router)
+		s.mu.Lock()
+		s.gatewayHTTPServer = &http.Server{Handler: mux}
+		s.mu.Unlock()
+	} else {
+		s.mu.Lock()
+		s.gatewayHTTPServer = &http.Server{Handler: router}
+		s.mu.Unlock()
+	}
+
 	if err := s.gatewayHTTPServer.Serve(ln); err != nil {
-		log.Errorf("error in gateway Serve: %s", err)
+		if err == ErrServerClosed || strings.Contains(err.Error(), "listener closed") {
+			log.Info("gateway server closed")
+		} else {
+			log.Errorf("error in gateway Serve: %T %s", err, err)
+		}
 	}
 }
 
@@ -58,6 +91,13 @@ func (s *Server) closeHTTP1APIGateway(ctx context.Context) error {
 }
 
 func (s *Server) handleGatewayRequest(w http.ResponseWriter, r *http.Request, params httprouter.Params) {
+	ctx := context.WithValue(r.Context(), RemoteConnContextKey, r.RemoteAddr) // notice: It is a string, different with TCP (net.Conn)
+	err := s.Plugins.DoPreReadRequest(ctx)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
 	if r.Header.Get(XServicePath) == "" {
 		servicePath := params.ByName("servicePath")
 		if strings.HasPrefix(servicePath, "/") {
@@ -104,8 +144,13 @@ func (s *Server) handleGatewayRequest(w http.ResponseWriter, r *http.Request, pa
 		wh.Set(XErrorMessage, err.Error())
 		return
 	}
+	err = s.Plugins.DoPostReadRequest(ctx, req, nil)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
 
-	ctx := context.WithValue(context.Background(), StartRequestContextKey, time.Now().UnixNano())
+	ctx = context.WithValue(ctx, StartRequestContextKey, time.Now().UnixNano())
 	err = s.auth(ctx, req)
 	if err != nil {
 		s.Plugins.DoPreWriteResponse(ctx, req, nil)

@@ -1,4 +1,27 @@
-# [rpcx](http://rpcx.site)
+# [rpcx](http://rpcx.io)
+
+## 6.0 (developing)
+
+- support reflection
+
+## 5.0 
+
+- support jsonrpc 2.0
+- support CORS for jsonrpc 2.0
+- support opentracing and opencensus
+- upload/download files by streaming
+- add Pool for XClient and OneClient
+- remove rudp support
+- add ConnCreated plugin. Yu can use it to set KCP UDPSession
+- update client plugins. All plugin returns error instead of bool
+- support ETCD 3.0 API
+- support redis as registry
+- support redis DB selection
+- fix RegisterFunction issues
+- add Filter for clients
+- remove most of build tags such as etcd, zookeeper,consul,reuseport
+- add Nacos as registry http://nacos.io
+- support blacklist and whitlist
 
 ## 4.0
 
@@ -11,8 +34,8 @@
 - Support shutdown graceful
 - Add [rpcx-java](https://github.com/smallnest/rpcx-java) to support develop raw java services and clients
 - Support thrift codec 
-- Setup rpcx offcial site: http://rpcx.site
-- Add Chinese document: http://doc.rpcx.site or https://smallnest.gitbooks.io/go-rpc-programming-guide
+- Setup rpcx offcial site: http://rpcx.io
+- Add Chinese document: http://cn.doc.rpcx.io or https://smallnest.gitbooks.io/go-rpc-programming-guide
 
 ## 3.1
 

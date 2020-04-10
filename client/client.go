@@ -13,10 +13,12 @@ import (
 	"sync"
 	"time"
 
+	opentracing "github.com/opentracing/opentracing-go"
 	circuit "github.com/rubyist/circuitbreaker"
 	"github.com/smallnest/rpcx/log"
 	"github.com/smallnest/rpcx/protocol"
 	"github.com/smallnest/rpcx/share"
+	"go.opencensus.io/trace"
 )
 
 const (
@@ -188,11 +190,15 @@ func (client *Client) UnregisterServerMessageChan() {
 
 // IsClosing client is closing or not.
 func (client *Client) IsClosing() bool {
+	client.mutex.Lock()
+	defer client.mutex.Unlock()
 	return client.closing
 }
 
 // IsShutdown client is shutdown or not.
 func (client *Client) IsShutdown() bool {
+	client.mutex.Lock()
+	defer client.mutex.Unlock()
 	return client.shutdown
 }
 
@@ -208,6 +214,15 @@ func (client *Client) Go(ctx context.Context, servicePath, serviceMethod string,
 	if meta != nil { //copy meta in context to meta in requests
 		call.Metadata = meta.(map[string]string)
 	}
+
+	if _, ok := ctx.(*share.Context); !ok {
+		ctx = share.NewContext(ctx)
+	}
+
+	// TODO: should implement as plugin
+	client.injectOpenTracingSpan(ctx, call)
+	client.injectOpenCensusSpan(ctx, call)
+
 	call.Args = args
 	call.Reply = reply
 	if done == nil {
@@ -224,6 +239,59 @@ func (client *Client) Go(ctx context.Context, servicePath, serviceMethod string,
 	call.Done = done
 	client.send(ctx, call)
 	return call
+}
+
+func (client *Client) injectOpenTracingSpan(ctx context.Context, call *Call) {
+	var rpcxContext *share.Context
+	var ok bool
+	if rpcxContext, ok = ctx.(*share.Context); !ok {
+		return
+	}
+	sp := rpcxContext.Value(share.OpentracingSpanClientKey)
+	if sp == nil { // have not config opentracing plugin
+		return
+	}
+
+	span := sp.(opentracing.Span)
+	if call.Metadata == nil {
+		call.Metadata = make(map[string]string)
+	}
+	meta := call.Metadata
+
+	err := opentracing.GlobalTracer().Inject(
+		span.Context(),
+		opentracing.TextMap,
+		opentracing.TextMapCarrier(meta))
+	if err != nil {
+		log.Errorf("failed to inject span: %v", err)
+	}
+}
+
+func (client *Client) injectOpenCensusSpan(ctx context.Context, call *Call) {
+	var rpcxContext *share.Context
+	var ok bool
+	if rpcxContext, ok = ctx.(*share.Context); !ok {
+		return
+	}
+	sp := rpcxContext.Value(share.OpencensusSpanClientKey)
+	if sp == nil { // have not config opencensus plugin
+		return
+	}
+
+	span := sp.(*trace.Span)
+	if span == nil {
+		return
+	}
+	if call.Metadata == nil {
+		call.Metadata = make(map[string]string)
+	}
+	meta := call.Metadata
+
+	spanContext := span.SpanContext()
+	scData := make([]byte, 24)
+	copy(scData[:16], spanContext.TraceID[:])
+	copy(scData[16:24], spanContext.SpanID[:])
+	meta[share.OpencensusSpanRequestKey] = string(scData)
 }
 
 // Call invokes the named function, waits for it to complete, and returns its error status.
@@ -274,11 +342,14 @@ func (client *Client) SendRaw(ctx context.Context, r *protocol.Message) (map[str
 	meta := ctx.Value(share.ReqMetaDataKey)
 
 	rmeta := make(map[string]string)
+
+	// copy meta to rmeta
 	if meta != nil {
 		for k, v := range meta.(map[string]string) {
 			rmeta[k] = v
 		}
 	}
+	// copy r.Metadata to rmeta
 	if r.Metadata != nil {
 		for k, v := range r.Metadata {
 			rmeta[k] = v
@@ -288,6 +359,8 @@ func (client *Client) SendRaw(ctx context.Context, r *protocol.Message) (map[str
 	if meta != nil { //copy meta in context to meta in requests
 		call.Metadata = rmeta
 	}
+	r.Metadata = rmeta
+
 	done := make(chan *Call, 10)
 	call.Done = done
 
@@ -445,6 +518,7 @@ func (client *Client) send(ctx context.Context, call *Call) {
 
 		data, err := codec.Encode(call.Args)
 		if err != nil {
+			delete(client.pending, seq)
 			call.Error = err
 			call.done()
 			return
@@ -456,6 +530,9 @@ func (client *Client) send(ctx context.Context, call *Call) {
 		req.Payload = data
 	}
 
+	if client.Plugins != nil {
+		client.Plugins.DoClientBeforeEncode(req)
+	}
 	data := req.Encode()
 
 	_, err := client.Conn.Write(data)
@@ -468,6 +545,7 @@ func (client *Client) send(ctx context.Context, call *Call) {
 			call.Error = err
 			call.done()
 		}
+		protocol.FreeMsg(req)
 		return
 	}
 
@@ -492,19 +570,21 @@ func (client *Client) send(ctx context.Context, call *Call) {
 
 func (client *Client) input() {
 	var err error
-	var res = protocol.NewMessage()
 
 	for err == nil {
+		var res = protocol.NewMessage()
 		if client.option.ReadTimeout != 0 {
 			client.Conn.SetReadDeadline(time.Now().Add(client.option.ReadTimeout))
 		}
 
 		err = res.Decode(client.r)
-		//res, err = protocol.Read(client.r)
-
 		if err != nil {
 			break
 		}
+		if client.Plugins != nil {
+			client.Plugins.DoClientAfterDecode(res)
+		}
+
 		seq := res.Seq()
 		var call *Call
 		isServerMessage := (res.MessageType() == protocol.Request && !res.IsHeartbeat() && res.IsOneway())
@@ -520,19 +600,14 @@ func (client *Client) input() {
 			if isServerMessage {
 				if client.ServerMessageChan != nil {
 					go client.handleServerRequest(res)
-					res = protocol.NewMessage()
 				}
 				continue
 			}
 		case res.MessageStatusType() == protocol.Error:
 			// We've got an error response. Give this to the request
 			if len(res.Metadata) > 0 {
-				meta := make(map[string]string, len(res.Metadata))
-				for k, v := range res.Metadata {
-					meta[k] = v
-				}
-				call.ResMetadata = meta
-				call.Error = ServiceError(meta[protocol.ServiceError])
+				call.ResMetadata = res.Metadata
+				call.Error = ServiceError(res.Metadata[protocol.ServiceError])
 			}
 
 			if call.Raw {
@@ -557,10 +632,6 @@ func (client *Client) input() {
 					}
 				}
 				if len(res.Metadata) > 0 {
-					meta := make(map[string]string, len(res.Metadata))
-					for k, v := range res.Metadata {
-						meta[k] = v
-					}
 					call.ResMetadata = res.Metadata
 				}
 
@@ -568,8 +639,6 @@ func (client *Client) input() {
 
 			call.done()
 		}
-
-		res.Reset()
 	}
 	// Terminate pending calls.
 
@@ -593,8 +662,8 @@ func (client *Client) input() {
 			client.Plugins.DoClientConnectionClose(client.Conn)
 		}
 		client.pluginClosed = true
-		client.Conn.Close()
 	}
+	client.Conn.Close()
 	client.shutdown = true
 	closing := client.closing
 	if err == io.EOF {
@@ -637,7 +706,8 @@ func (client *Client) heartbeat() {
 	t := time.NewTicker(client.option.HeartbeatInterval)
 
 	for range t.C {
-		if client.shutdown || client.closing {
+		if client.IsShutdown() || client.IsClosing() {
+			t.Stop()
 			return
 		}
 

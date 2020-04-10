@@ -1,5 +1,3 @@
-// +build zookeeper
-
 package serverplugin
 
 import (
@@ -102,14 +100,14 @@ func (p *ZooKeeperRegisterPlugin) Start() error {
 							meta := p.metas[name]
 							p.metasLock.RUnlock()
 
-							err = p.kv.Put(nodePath, []byte(meta), &store.WriteOptions{TTL: p.UpdateInterval * 3})
+							err = p.kv.Put(nodePath, []byte(meta), &store.WriteOptions{TTL: p.UpdateInterval * 2})
 							if err != nil {
 								log.Errorf("cannot re-create zookeeper path %s: %v", nodePath, err)
 							}
 						} else {
 							v, _ := url.ParseQuery(string(kvPaire.Value))
 							v.Set("tps", string(data))
-							p.kv.Put(nodePath, []byte(v.Encode()), &store.WriteOptions{TTL: p.UpdateInterval * 3})
+							p.kv.Put(nodePath, []byte(v.Encode()), &store.WriteOptions{TTL: p.UpdateInterval * 2})
 						}
 					}
 				}
@@ -215,10 +213,13 @@ func (p *ZooKeeperRegisterPlugin) Register(name string, rcvr interface{}, metada
 	return
 }
 
+func (p *ZooKeeperRegisterPlugin) RegisterFunction(serviceName, fname string, fn interface{}, metadata string) error {
+	return p.Register(serviceName, fn, metadata)
+}
+
 func (p *ZooKeeperRegisterPlugin) Unregister(name string) (err error) {
 	if "" == strings.TrimSpace(name) {
-		err = errors.New("Register service `name` can't be empty")
-		return
+		return errors.New("Register service `name` can't be empty")
 	}
 
 	if p.kv == nil {
@@ -269,5 +270,6 @@ func (p *ZooKeeperRegisterPlugin) Unregister(name string) (err error) {
 	}
 	delete(p.metas, name)
 	p.metasLock.Unlock()
-	return
+
+	return nil
 }

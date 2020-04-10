@@ -44,7 +44,7 @@ func NewOneClient(failMode FailMode, selectMode SelectMode, discovery ServiceDis
 }
 
 // NewBidirectionalOneClient creates a new xclient that can receive notifications from servers.
-func NewBidirectionalOneClient(servicePath string, failMode FailMode, selectMode SelectMode, discovery ServiceDiscovery, option Option, serverMessageChan chan<- *protocol.Message) *OneClient {
+func NewBidirectionalOneClient(failMode FailMode, selectMode SelectMode, discovery ServiceDiscovery, option Option, serverMessageChan chan<- *protocol.Message) *OneClient {
 	return &OneClient{
 		failMode:          failMode,
 		selectMode:        selectMode,
@@ -74,6 +74,10 @@ func (c *OneClient) SetPlugins(plugins PluginContainer) {
 		v.SetPlugins(plugins)
 	}
 	c.mu.RUnlock()
+}
+
+func (c *OneClient) GetPlugins() PluginContainer {
+	return c.Plugins
 }
 
 // ConfigGeoSelector sets location of client's latitude and longitude,

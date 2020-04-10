@@ -37,6 +37,7 @@ var (
 // One XClient is used only for one service. You should create multiple XClient for multiple services.
 type XClient interface {
 	SetPlugins(plugins PluginContainer)
+	GetPlugins() PluginContainer
 	SetSelector(s Selector)
 	ConfigGeoSelector(latitude, longitude float64)
 	Auth(auth string)
@@ -57,12 +58,18 @@ type KVPair struct {
 	Value string
 }
 
+// ServiceDiscoveryFilter can be used to filter services with customized logics.
+// Servers can register its services but clients can use the customized filter to select some services.
+// It returns true if ServiceDiscovery wants to use this service, otherwise it returns false.
+type ServiceDiscoveryFilter func(kvp *KVPair) bool
+
 // ServiceDiscovery defines ServiceDiscovery of zookeeper, etcd and consul
 type ServiceDiscovery interface {
 	GetServices() []*KVPair
 	WatchService() chan []*KVPair
 	RemoveWatcher(ch chan []*KVPair)
 	Clone(servicePath string) ServiceDiscovery
+	SetFilter(ServiceDiscoveryFilter)
 	Close()
 }
 
@@ -102,8 +109,8 @@ func NewXClient(servicePath string, failMode FailMode, selectMode SelectMode, di
 		option:       option,
 	}
 
-	servers := make(map[string]string)
 	pairs := discovery.GetServices()
+	servers := make(map[string]string, len(pairs))
 	for _, p := range pairs {
 		servers[p.Key] = p.Value
 	}
@@ -137,8 +144,8 @@ func NewBidirectionalXClient(servicePath string, failMode FailMode, selectMode S
 		serverMessageChan: serverMessageChan,
 	}
 
-	servers := make(map[string]string)
 	pairs := discovery.GetServices()
+	servers := make(map[string]string, len(pairs))
 	for _, p := range pairs {
 		servers[p.Key] = p.Value
 	}
@@ -173,6 +180,10 @@ func (c *xClient) SetPlugins(plugins PluginContainer) {
 	c.Plugins = plugins
 }
 
+func (c *xClient) GetPlugins() PluginContainer {
+	return c.Plugins
+}
+
 // ConfigGeoSelector sets location of client's latitude and longitude,
 // and use newGeoSelector.
 func (c *xClient) ConfigGeoSelector(latitude, longitude float64) {
@@ -188,7 +199,7 @@ func (c *xClient) Auth(auth string) {
 // watch changes of service and update cached clients.
 func (c *xClient) watch(ch chan []*KVPair) {
 	for pairs := range ch {
-		servers := make(map[string]string)
+		servers := make(map[string]string, len(pairs))
 		for _, p := range pairs {
 			servers[p.Key] = p.Value
 		}
@@ -229,26 +240,35 @@ func (c *xClient) selectClient(ctx context.Context, servicePath, serviceMethod s
 }
 
 func (c *xClient) getCachedClient(k string) (RPCClient, error) {
-	c.mu.RLock()
+	// TODO: improve the lock
+	var client RPCClient
+	var needCallPlugin bool
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	defer func() {
+		if needCallPlugin {
+			c.Plugins.DoClientConnected((client.(*Client)).Conn)
+		}
+	}()
+
+	if c.isShutdown {
+		return nil, errors.New("this xclient is closed")
+	}
+
 	breaker, ok := c.breakers.Load(k)
 	if ok && !breaker.(Breaker).Ready() {
-		c.mu.RUnlock()
 		return nil, ErrBreakerOpen
 	}
 
-	client := c.cachedClient[k]
+	client = c.cachedClient[k]
 	if client != nil {
 		if !client.IsClosing() && !client.IsShutdown() {
-			c.mu.RUnlock()
 			return client, nil
 		}
 		delete(c.cachedClient, k)
 		client.Close()
 	}
-	c.mu.RUnlock()
 
-	//double check
-	c.mu.Lock()
 	client = c.cachedClient[k]
 	if client == nil || client.IsShutdown() {
 		network, addr := splitNetworkAndAddress(k)
@@ -269,20 +289,17 @@ func (c *xClient) getCachedClient(k string) (RPCClient, error) {
 				if breaker != nil {
 					breaker.(Breaker).Fail()
 				}
-				c.mu.Unlock()
 				return nil, err
 			}
 			if c.Plugins != nil {
-				c.Plugins.DoClientConnected((client.(*Client)).Conn)
+				needCallPlugin = true
 			}
-
 		}
 
 		client.RegisterServerMessageChan(c.serverMessageChan)
 
 		c.cachedClient[k] = client
 	}
-	c.mu.Unlock()
 
 	return client, nil
 }
@@ -293,11 +310,13 @@ func (c *xClient) getCachedClientWithoutLock(k string) (RPCClient, error) {
 		if !client.IsClosing() && !client.IsShutdown() {
 			return client, nil
 		}
+		delete(c.cachedClient, k)
+		client.Close()
 	}
 
 	//double check
 	client = c.cachedClient[k]
-	if client == nil {
+	if client == nil || client.IsShutdown() {
 		network, addr := splitNetworkAndAddress(k)
 		if network == "inprocess" {
 			client = InprocessClient
@@ -354,7 +373,7 @@ func (c *xClient) Go(ctx context.Context, serviceMethod string, args interface{}
 		metadata := ctx.Value(share.ReqMetaDataKey)
 		if metadata == nil {
 			metadata = map[string]string{}
-			ctx = context.WithValue(ctx,share.ReqMetaDataKey,metadata)
+			ctx = context.WithValue(ctx, share.ReqMetaDataKey, metadata)
 		}
 		m := metadata.(map[string]string)
 		m[share.AuthKey] = c.auth
@@ -378,7 +397,7 @@ func (c *xClient) Call(ctx context.Context, serviceMethod string, args interface
 		metadata := ctx.Value(share.ReqMetaDataKey)
 		if metadata == nil {
 			metadata = map[string]string{}
-			ctx = context.WithValue(ctx,share.ReqMetaDataKey,metadata)
+			ctx = context.WithValue(ctx, share.ReqMetaDataKey, metadata)
 		}
 		m := metadata.(map[string]string)
 		m[share.AuthKey] = c.auth
@@ -396,7 +415,7 @@ func (c *xClient) Call(ctx context.Context, serviceMethod string, args interface
 	switch c.failMode {
 	case Failtry:
 		retries := c.option.Retries
-		for retries > 0 {
+		for retries >= 0 {
 			retries--
 
 			if client != nil {
@@ -409,7 +428,9 @@ func (c *xClient) Call(ctx context.Context, serviceMethod string, args interface
 				}
 			}
 
-			c.removeClient(k, client)
+			if uncoverError(err) {
+				c.removeClient(k, client)
+			}
 			client, e = c.getCachedClient(k)
 		}
 		if err == nil {
@@ -418,7 +439,7 @@ func (c *xClient) Call(ctx context.Context, serviceMethod string, args interface
 		return err
 	case Failover:
 		retries := c.option.Retries
-		for retries > 0 {
+		for retries >= 0 {
 			retries--
 
 			if client != nil {
@@ -431,7 +452,9 @@ func (c *xClient) Call(ctx context.Context, serviceMethod string, args interface
 				}
 			}
 
-			c.removeClient(k, client)
+			if uncoverError(err) {
+				c.removeClient(k, client)
+			}
 			//select another server
 			k, client, e = c.selectClient(ctx, c.servicePath, serviceMethod, args)
 		}
@@ -471,7 +494,7 @@ func (c *xClient) Call(ctx context.Context, serviceMethod string, args interface
 		}
 		_, err2 := c.Go(ctx, serviceMethod, args, reply2, call2)
 		if err2 != nil {
-			if _, ok := err.(ServiceError); !ok {
+			if uncoverError(err2) {
 				c.removeClient(k, client)
 			}
 			err = err1
@@ -497,7 +520,7 @@ func (c *xClient) Call(ctx context.Context, serviceMethod string, args interface
 	default: //Failfast
 		err = c.wrapCall(ctx, client, serviceMethod, args, reply)
 		if err != nil {
-			if _, ok := err.(ServiceError); !ok {
+			if uncoverError(err) {
 				c.removeClient(k, client)
 			}
 		}
@@ -506,6 +529,21 @@ func (c *xClient) Call(ctx context.Context, serviceMethod string, args interface
 	}
 }
 
+func uncoverError(err error) bool {
+	if _, ok := err.(ServiceError); ok {
+		return false
+	}
+
+	if err == context.DeadlineExceeded {
+		return false
+	}
+
+	if err == context.Canceled {
+		return false
+	}
+
+	return true
+}
 func (c *xClient) SendRaw(ctx context.Context, r *protocol.Message) (map[string]string, []byte, error) {
 	if c.isShutdown {
 		return nil, nil, ErrXClientShutdown
@@ -515,7 +553,7 @@ func (c *xClient) SendRaw(ctx context.Context, r *protocol.Message) (map[string]
 		metadata := ctx.Value(share.ReqMetaDataKey)
 		if metadata == nil {
 			metadata = map[string]string{}
-			ctx = context.WithValue(ctx,share.ReqMetaDataKey,metadata)
+			ctx = context.WithValue(ctx, share.ReqMetaDataKey, metadata)
 		}
 		m := metadata.(map[string]string)
 		m[share.AuthKey] = c.auth
@@ -538,7 +576,7 @@ func (c *xClient) SendRaw(ctx context.Context, r *protocol.Message) (map[string]
 	switch c.failMode {
 	case Failtry:
 		retries := c.option.Retries
-		for retries > 0 {
+		for retries >= 0 {
 			retries--
 			if client != nil {
 				m, payload, err := client.SendRaw(ctx, r)
@@ -550,7 +588,9 @@ func (c *xClient) SendRaw(ctx context.Context, r *protocol.Message) (map[string]
 				}
 			}
 
-			c.removeClient(k, client)
+			if uncoverError(err) {
+				c.removeClient(k, client)
+			}
 			client, e = c.getCachedClient(k)
 		}
 
@@ -560,7 +600,7 @@ func (c *xClient) SendRaw(ctx context.Context, r *protocol.Message) (map[string]
 		return nil, nil, err
 	case Failover:
 		retries := c.option.Retries
-		for retries > 0 {
+		for retries >= 0 {
 			retries--
 			if client != nil {
 				m, payload, err := client.SendRaw(ctx, r)
@@ -572,7 +612,9 @@ func (c *xClient) SendRaw(ctx context.Context, r *protocol.Message) (map[string]
 				}
 			}
 
-			c.removeClient(k, client)
+			if uncoverError(err) {
+				c.removeClient(k, client)
+			}
 			//select another server
 			k, client, e = c.selectClient(ctx, r.ServicePath, r.ServiceMethod, r.Payload)
 		}
@@ -586,7 +628,7 @@ func (c *xClient) SendRaw(ctx context.Context, r *protocol.Message) (map[string]
 		m, payload, err := client.SendRaw(ctx, r)
 
 		if err != nil {
-			if _, ok := err.(ServiceError); !ok {
+			if uncoverError(err) {
 				c.removeClient(k, client)
 			}
 		}
@@ -598,6 +640,8 @@ func (c *xClient) wrapCall(ctx context.Context, client RPCClient, serviceMethod 
 	if client == nil {
 		return ErrServerUnavailable
 	}
+
+	ctx = share.NewContext(ctx)
 	c.Plugins.DoPreCall(ctx, c.servicePath, serviceMethod, args)
 	err := client.Call(ctx, c.servicePath, serviceMethod, args, reply)
 	c.Plugins.DoPostCall(ctx, c.servicePath, serviceMethod, args, reply, err)
@@ -617,7 +661,7 @@ func (c *xClient) Broadcast(ctx context.Context, serviceMethod string, args inte
 		metadata := ctx.Value(share.ReqMetaDataKey)
 		if metadata == nil {
 			metadata = map[string]string{}
-			ctx = context.WithValue(ctx,share.ReqMetaDataKey,metadata)
+			ctx = context.WithValue(ctx, share.ReqMetaDataKey, metadata)
 		}
 		m := metadata.(map[string]string)
 		m[share.AuthKey] = c.auth
@@ -648,7 +692,9 @@ func (c *xClient) Broadcast(ctx context.Context, serviceMethod string, args inte
 			e := c.wrapCall(ctx, client, serviceMethod, args, reply)
 			done <- (e == nil)
 			if e != nil {
-				c.removeClient(k, client)
+				if uncoverError(err) {
+					c.removeClient(k, client)
+				}
 				err.Append(e)
 			}
 		}()
@@ -686,7 +732,7 @@ func (c *xClient) Fork(ctx context.Context, serviceMethod string, args interface
 		metadata := ctx.Value(share.ReqMetaDataKey)
 		if metadata == nil {
 			metadata = map[string]string{}
-			ctx = context.WithValue(ctx,share.ReqMetaDataKey,metadata)
+			ctx = context.WithValue(ctx, share.ReqMetaDataKey, metadata)
 		}
 		m := metadata.(map[string]string)
 		m[share.AuthKey] = c.auth
@@ -725,7 +771,9 @@ func (c *xClient) Fork(ctx context.Context, serviceMethod string, args interface
 			}
 			done <- (e == nil)
 			if e != nil {
-				c.removeClient(k, client)
+				if uncoverError(err) {
+					c.removeClient(k, client)
+				}
 				err.Append(e)
 			}
 
@@ -888,10 +936,9 @@ loop:
 
 // Close closes this client and its underlying connnections to services.
 func (c *xClient) Close() error {
-	c.isShutdown = true
-
 	var errs []error
 	c.mu.Lock()
+	c.isShutdown = true
 	for k, v := range c.cachedClient {
 		e := v.Close()
 		if e != nil {

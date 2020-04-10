@@ -1,5 +1,3 @@
-// +build consul
-
 package serverplugin
 
 import (
@@ -102,14 +100,14 @@ func (p *ConsulRegisterPlugin) Start() error {
 							meta := p.metas[name]
 							p.metasLock.RUnlock()
 
-							err = p.kv.Put(nodePath, []byte(meta), &store.WriteOptions{TTL: p.UpdateInterval * 3})
+							err = p.kv.Put(nodePath, []byte(meta), &store.WriteOptions{TTL: p.UpdateInterval * 2})
 							if err != nil {
 								log.Errorf("cannot re-create consul path %s: %v", nodePath, err)
 							}
 						} else {
 							v, _ := url.ParseQuery(string(kvPaire.Value))
 							v.Set("tps", string(data))
-							p.kv.Put(nodePath, []byte(v.Encode()), &store.WriteOptions{TTL: p.UpdateInterval * 3})
+							p.kv.Put(nodePath, []byte(v.Encode()), &store.WriteOptions{TTL: p.UpdateInterval * 2})
 						}
 					}
 				}
@@ -212,6 +210,10 @@ func (p *ConsulRegisterPlugin) Register(name string, rcvr interface{}, metadata 
 	p.metas[name] = metadata
 	p.metasLock.Unlock()
 	return
+}
+
+func (p *ConsulRegisterPlugin) RegisterFunction(serviceName, fname string, fn interface{}, metadata string) error {
+	return p.Register(serviceName, fn, metadata)
 }
 
 func (p *ConsulRegisterPlugin) Unregister(name string) (err error) {
